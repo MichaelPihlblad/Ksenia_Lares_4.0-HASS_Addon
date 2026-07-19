@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 
+from homeassistant.const import CONF_SCAN_INTERVAL
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
@@ -17,6 +18,7 @@ from .const import (
     CONF_PORT,
     CONF_SSL,
     DEFAULT_PLATFORMS,
+    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     SETUP_TIMEOUT,
 )
@@ -285,6 +287,7 @@ async def _setup_connection(hass, entry, ip, port, pin, use_ssl) -> WebSocketMan
         _LOGGER,
         max_retries=3,
         on_prolonged_connection_loss=_on_prolonged_connection_loss,
+        periodic_read_interval=entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
     )
     hass.data.setdefault(DOMAIN, {})["ws_manager"] = ws_manager
     try:
