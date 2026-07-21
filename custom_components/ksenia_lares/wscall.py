@@ -175,7 +175,7 @@ async def ws_login(websocket, pin, _LOGGER):
         - login_id: Session ID on success, -1 on failure
         - result_detail: Error detail string (e.g., "LOGIN_KO") on failure, None on success
     """
-    payload = {"PIN": pin}
+    payload = {"PIN": str(pin)}
     json_cmd = _build_message("LOGIN", "USER", payload)
 
     _LOGGER.debug(f"[{datetime.now()}] Sending LOGIN request")
@@ -903,15 +903,30 @@ async def clearFaultsMemory(websocket, login_id, pin, command_data, queue, logge
     )
 
 
-async def writeThermostatConfig(websocket, login_id, command_data, queue, logger):
+async def writeThermostatConfig(websocket, login_id, pin, command_data, queue, logger):
     """Send WRITE_CFG command to update chronothermostat configuration.
 
     Sends a partial thermostat config update (mode change, setpoint, etc.)
     to the Ksenia Lares panel. Only the fields present in thermo_cfg are sent.
 
+    Per the Ksenia WebSocket SDK, WRITE_CFG's PAYLOAD_TYPE is *always*
+    "CFG_ALL" regardless of which configuration structure(s) the payload
+    actually carries - the structure itself is identified by its key inside
+    PAYLOAD (here "CFG_THERMOSTATS"). This previously sent
+    PAYLOAD_TYPE="CFG_THERMOSTATS" instead, a value the SDK never documents
+    for this command; that protocol violation is the most likely explanation
+    for the panel never sending a WRITE_CFG_RES and the write hanging until
+    the client-side timeout.
+
+    The SDK also notes PIN is only mandatory for WRITE_CFG when logged in as
+    ERGO-T/IP_SUPERV; a USER-type login (what this integration always uses)
+    can omit it. It's still included here since sending it is harmless and
+    keeps this call consistent with every other mutating command.
+
     Args:
         websocket: WebSocket connection object
         login_id: Authenticated session ID
+        pin: Authentication PIN
         command_data: Command dictionary with thermo_cfg dict and future
         queue: Pending commands queue
         logger: Logger instance for diagnostics
@@ -921,12 +936,13 @@ async def writeThermostatConfig(websocket, login_id, command_data, queue, logger
     try:
         payload = {
             "ID_LOGIN": str(login_id),
+            "PIN": str(pin),
             "CFG_THERMOSTATS": [command_data["thermo_cfg"]],
         }
-        json_cmd = _build_message("WRITE_CFG", "CFG_THERMOSTATS", payload, msg_id=command_id)
+        json_cmd = _build_message("WRITE_CFG", "CFG_ALL", payload, msg_id=command_id)
 
         command_data["command_id"] = command_id
-        command_data["message"] = {"CMD": "WRITE_CFG", "PAYLOAD_TYPE": "CFG_THERMOSTATS"}
+        command_data["message"] = {"CMD": "WRITE_CFG", "PAYLOAD_TYPE": "CFG_ALL"}
         command_data["created_at"] = time.monotonic()
         queue[command_id] = command_data
         logger.debug(f"WRITE_CFG CFG_THERMOSTATS: {_sanitize_logmessage(json_cmd)}")
