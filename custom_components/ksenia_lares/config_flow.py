@@ -6,9 +6,20 @@ import logging
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig, SelectSelectorMode
+from homeassistant.const import CONF_SCAN_INTERVAL
+from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from .const import (
+    CONF_ARM_HOME_SCENARIO_ID,
+    CONF_ARM_NIGHT_SCENARIO_ID,
     CONF_BRAND,
     CONF_HOST,
     CONF_PIN,
@@ -18,8 +29,10 @@ from .const import (
     DEFAULT_BRAND,
     DEFAULT_PLATFORMS,
     DEFAULT_PORT,
+    DEFAULT_SCAN_INTERVAL,
     DEFAULT_SSL,
     DOMAIN,
+    MIN_SCAN_INTERVAL,
     DeviceBrand,
 )
 from .websocketmanager import AuthenticationError, WebSocketManager
@@ -214,3 +227,93 @@ class KseniaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return True
         except ValueError:
             return False
+
+    @staticmethod
+    def async_get_options_flow(config_entry):  # noqa: ARG004
+        """Get the options flow for this handler."""
+        return KseniaOptionsFlowHandler()
+
+
+class KseniaOptionsFlowHandler(config_entries.OptionsFlow):
+    """Ksenia Lares options flow.
+
+    Lets the installer choose which CAT=PARTIAL scenario the Arm Home and
+    (optional) Arm Night actions execute, for panels that expose more than
+    one PARTIAL scenario (e.g. "Arm Home" and a custom "Arm Motion" scenario).
+    Also lets them configure (or disable) the periodic state-polling interval.
+    """
+
+    async def async_step_init(self, user_input=None):
+        """Manage integration options."""
+        errors = {}
+        if user_input is not None:
+            interval = user_input.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+            if 0 < interval < MIN_SCAN_INTERVAL:
+                errors[CONF_SCAN_INTERVAL] = "scan_interval_too_low"
+            else:
+                return self.async_create_entry(title="", data=user_input)
+
+        ws_manager = self.hass.data.get(DOMAIN, {}).get("ws_manager")
+        if ws_manager is None:
+            return self.async_abort(reason="not_connected")
+
+        scenarios = await ws_manager.getScenarios()
+        partial_scenarios = [s for s in scenarios if s.get("CAT", "").upper() == "PARTIAL"]
+        if not partial_scenarios:
+            return self.async_abort(reason="no_partial_scenarios")
+
+        # Matches _build_scenario_map's current last-CAT-wins behavior, so the
+        # preselected default reflects what Arm Home actually does today.
+        default_home_id = str(partial_scenarios[-1].get("ID"))
+
+        partial_options: list[SelectOptionDict] = [
+            SelectOptionDict(
+                value=str(scenario.get("ID")),
+                label=f"{scenario.get('DES', scenario.get('ID'))} (ID {scenario.get('ID')})",
+            )
+            for scenario in partial_scenarios
+        ]
+
+        schema = vol.Schema(
+            {
+                vol.Optional(CONF_ARM_HOME_SCENARIO_ID): SelectSelector(
+                    SelectSelectorConfig(
+                        options=partial_options,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                # No default: Arm Night stays disabled until explicitly configured.
+                vol.Optional(CONF_ARM_NIGHT_SCENARIO_ID): SelectSelector(
+                    SelectSelectorConfig(
+                        options=partial_options,
+                        mode=SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                # 0 disables polling entirely; 1-9 rejected server-side (see errors above).
+                vol.Optional(CONF_SCAN_INTERVAL): NumberSelector(
+                    NumberSelectorConfig(
+                        min=0,
+                        max=3600,
+                        step=1,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="s",
+                    )
+                ),
+            }
+        )
+
+        suggested_values = {
+            CONF_ARM_HOME_SCENARIO_ID: self.config_entry.options.get(
+                CONF_ARM_HOME_SCENARIO_ID, default_home_id
+            ),
+            CONF_SCAN_INTERVAL: self.config_entry.options.get(
+                CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+            ),
+        }
+        if CONF_ARM_NIGHT_SCENARIO_ID in self.config_entry.options:
+            suggested_values[CONF_ARM_NIGHT_SCENARIO_ID] = self.config_entry.options[
+                CONF_ARM_NIGHT_SCENARIO_ID
+            ]
+        schema = self.add_suggested_values_to_schema(schema, suggested_values)
+
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

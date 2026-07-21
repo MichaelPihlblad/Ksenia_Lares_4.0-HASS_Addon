@@ -531,7 +531,6 @@ def test_ksenia_switch_entity_siren_not_added(monkeypatch):
 
 
 
-@pytest.mark.asyncio
 def test_binary_sensor_thermo_output_not_classified_as_siren():
     """CAT=THERMO hidden outputs (heating relays) must not get device_class SOUND.
 
@@ -562,7 +561,6 @@ def test_binary_sensor_thermo_output_not_classified_as_siren():
     assert by_id["8"].is_on is True
 
 
-@pytest.mark.asyncio
 def test_ksenia_switch_entity_non_siren_enabled(monkeypatch):
     """Test that non-siren, non-hidden switches are added and enabled by default (unit test for _add_output_switches)."""
     from custom_components.ksenia_lares import switch
@@ -753,24 +751,23 @@ async def test_ksenia_event_log_sensor_initialization():
 
 @pytest.mark.asyncio
 async def test_ksenia_event_log_sensor_updates():
-    """Test KseniaEventLogSensor fetches logs correctly."""
+    """Test KseniaEventLogSensor processes a pushed batch of logs correctly."""
     from custom_components.ksenia_lares.sensor import KseniaEventLogSensor
-    
+
     ws_manager = MagicMock()
-    
-    # Mock getLastLogs to return sample logs (most recent first per API)
+
+    # Sample logs as pushed by the periodic-read task (most recent first per API)
     sample_logs = [
         {"EV": "ARM", "TYPE": "MANUAL", "DATE": "2024-01-03"},
         {"EV": "DISARM", "TYPE": "MANUAL", "DATE": "2024-01-02"},
         {"EV": "ALARM", "TYPE": "ZONE", "DATE": "2024-01-01"},
     ]
-    ws_manager.getLastLogs = AsyncMock(return_value=sample_logs)
-    
+
     entity = KseniaEventLogSensor(ws_manager)
     entity.async_write_ha_state = MagicMock()
-    
-    await entity.async_update()
-    
+
+    await entity._handle_logs_update(sample_logs)
+
     # Logs are stored as returned from API (newest first)
     # Input is [ARM, DISARM, ALARM] which is already in newest→oldest order
     assert entity._raw_logs is not None
@@ -779,7 +776,82 @@ async def test_ksenia_event_log_sensor_updates():
     assert entity._raw_logs[0].get("EV") == "ARM"
     # Last entry should be oldest: ALARM
     assert entity._raw_logs[-1].get("EV") == "ALARM"
-    ws_manager.getLastLogs.assert_called_once()
+    entity.async_write_ha_state.assert_called_once()
+
+
+def test_event_log_sensor_should_poll_is_false():
+    """KseniaEventLogSensor no longer overrides should_poll - fully listener-driven now."""
+    from custom_components.ksenia_lares.sensor import KseniaEventLogSensor
+
+    entity = KseniaEventLogSensor(MagicMock())
+    assert entity.should_poll is False
+
+
+def test_event_logs_channel_is_registerable():
+    """The "event_logs" channel is a recognized listener type."""
+    from custom_components.ksenia_lares.websocketmanager import WebSocketManager
+
+    manager = WebSocketManager("192.168.1.50", "1234", 443, MagicMock())
+    assert "event_logs" in manager.listeners
+
+
+@pytest.mark.asyncio
+async def test_periodic_read_task_fetches_and_notifies_logs(monkeypatch):
+    """Each periodic tick fetches recent logs and pushes them to "event_logs" listeners."""
+    from custom_components.ksenia_lares import websocketmanager as ws_module
+    from custom_components.ksenia_lares.websocketmanager import WebSocketManager
+
+    manager = WebSocketManager(
+        "192.168.1.50", "1234", 443, MagicMock(), periodic_read_interval=1
+    )
+    manager._running = True
+    manager._last_periodic_read = 0  # ensures the "time since last" check passes immediately
+
+    async def fake_sleep(_seconds):
+        manager._running = False  # stop the loop after one iteration
+
+    monkeypatch.setattr(ws_module.asyncio, "sleep", fake_sleep)
+    manager._refresh_all_state = AsyncMock()
+    manager.getLastLogs = AsyncMock(return_value=[{"EV": "ARM"}])
+
+    received = []
+
+    async def logs_listener(logs):
+        received.append(logs)
+
+    manager.listeners["event_logs"] = [logs_listener]
+
+    await manager._periodic_read_task()
+
+    manager._refresh_all_state.assert_called_once()
+    manager.getLastLogs.assert_called_once_with(count=5)
+    assert received == [[{"EV": "ARM"}]]
+
+
+@pytest.mark.asyncio
+async def test_periodic_read_task_log_fetch_failure_does_not_affect_state_refresh(monkeypatch):
+    """A failed log fetch is caught independently and doesn't affect the state refresh."""
+    from custom_components.ksenia_lares import websocketmanager as ws_module
+    from custom_components.ksenia_lares.websocketmanager import WebSocketManager
+
+    manager = WebSocketManager(
+        "192.168.1.50", "1234", 443, MagicMock(), periodic_read_interval=1
+    )
+    manager._running = True
+    manager._last_periodic_read = 0
+
+    async def fake_sleep(_seconds):
+        manager._running = False
+
+    monkeypatch.setattr(ws_module.asyncio, "sleep", fake_sleep)
+    manager._refresh_all_state = AsyncMock()
+    manager.getLastLogs = AsyncMock(side_effect=RuntimeError("network blip"))
+
+    # Should not raise despite the log fetch failing
+    await manager._periodic_read_task()
+
+    manager._refresh_all_state.assert_called_once()
+    manager.getLastLogs.assert_called_once_with(count=5)
 
 
 # ============================================================================
@@ -848,12 +920,12 @@ async def test_light_entity_availability_listener_via_async_added_to_hass():
 
     await entity.async_added_to_hass()
 
-    # Should register both "lights" (realtime) and "connection" (availability) listeners
+    # Should register both "lights" (realtime) and "availability" listeners
     assert "lights" in listeners
-    assert "connection" in listeners
+    assert "availability" in listeners
 
     # Trigger connection change and verify state write
-    await listeners["connection"][0]({"state": "disconnected", "available": False})
+    await listeners["availability"][0]({"state": "disconnected", "available": False})
     entity.async_write_ha_state.assert_called_once()
 
 
@@ -915,20 +987,48 @@ async def test_ksenia_button_entity_imports():
 @pytest.mark.asyncio
 async def test_websocket_manager_periodic_read_task_exists():
     """Test that WebSocketManager has periodic read task support."""
+    from custom_components.ksenia_lares.const import DEFAULT_SCAN_INTERVAL
     from custom_components.ksenia_lares.websocketmanager import WebSocketManager
-    
+
     manager = WebSocketManager("192.168.1.50", "1234", 443, MagicMock())
-    
+
     # Check that periodic read constants/methods exist
     assert hasattr(manager, "_periodic_read_task")
     assert hasattr(manager, "_last_periodic_read")
-    
-    # Check that PERIODIC_READ_INTERVAL is defined in the module
-    import inspect
-    from custom_components.ksenia_lares import websocketmanager
-    
-    source = inspect.getsource(websocketmanager)
-    assert "PERIODIC_READ_INTERVAL" in source
+
+    # Defaults to DEFAULT_SCAN_INTERVAL when not explicitly configured
+    assert manager._periodic_read_interval == DEFAULT_SCAN_INTERVAL
+
+
+def test_websocket_manager_periodic_read_interval_configurable():
+    """Test that periodic_read_interval can be overridden at construction."""
+    from custom_components.ksenia_lares.websocketmanager import WebSocketManager
+
+    manager = WebSocketManager("192.168.1.50", "1234", 443, MagicMock(), periodic_read_interval=30)
+
+    assert manager._periodic_read_interval == 30
+
+
+def test_websocket_manager_health_check_interval_scales_with_polling():
+    """Health-check threshold scales with the polling interval (floor: CONNECTION_HEALTH_CHECK)."""
+    from custom_components.ksenia_lares.websocketmanager import CONNECTION_HEALTH_CHECK, WebSocketManager
+
+    # Default (60s) interval keeps the existing 120s floor unchanged.
+    default_manager = WebSocketManager("192.168.1.50", "1234", 443, MagicMock())
+    assert default_manager._health_check_interval == CONNECTION_HEALTH_CHECK
+
+    # A larger interval (180s) scales the threshold up (360s), not stuck at 120s.
+    slow_manager = WebSocketManager(
+        "192.168.1.50", "1234", 443, MagicMock(), periodic_read_interval=180
+    )
+    assert slow_manager._health_check_interval == 360
+
+    # Disabled polling (0) still computes a (unused) floor value; the task
+    # simply never runs with it (see connect-time gating tests elsewhere).
+    disabled_manager = WebSocketManager(
+        "192.168.1.50", "1234", 443, MagicMock(), periodic_read_interval=0
+    )
+    assert disabled_manager._health_check_interval == CONNECTION_HEALTH_CHECK
 
 
 @pytest.mark.asyncio
@@ -1183,6 +1283,67 @@ async def test_ksenia_connection_status_sensor_initialization():
 
 
 @pytest.mark.asyncio
+async def test_connection_status_sensor_handles_real_status_connection_list():
+    """The real STATUS_CONNECTION list payload still updates state correctly."""
+    from custom_components.ksenia_lares.sensor import KseniaConnectionStatusSensor
+
+    ws_manager = MagicMock()
+    entity = KseniaConnectionStatusSensor(ws_manager)
+    entity.async_write_ha_state = MagicMock()
+
+    await entity._handle_connection_update(
+        [{"ETH": {"LINK": "OK"}, "INET": "ETH"}]
+    )
+
+    assert entity._state == "ethernet"
+    entity.async_write_ha_state.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_connection_status_sensor_ignores_availability_dict_payload():
+    """The dict-shaped availability ping never reaches this sensor at all.
+
+    Regression test for the KeyError: 0 crash - the availability ping and
+    the real STATUS_CONNECTION data are on separate channels now, so this
+    sensor (registered only on "connection") should never even receive the
+    dict shape. Directly calling the handler with a dict (as could only
+    happen if something were misrouted) would still raise, since the
+    handler's own code was never changed - the fix is at the channel
+    routing level, not a defensive check here.
+    """
+    from custom_components.ksenia_lares.websocketmanager import WebSocketManager
+
+    manager = WebSocketManager("192.168.1.50", "1234", 443, MagicMock())
+
+    received_on_connection = []
+    received_on_availability = []
+
+    async def connection_listener(payload):
+        received_on_connection.append(payload)
+
+    async def availability_listener(payload):
+        received_on_availability.append(payload)
+
+    manager.listeners["connection"] = [connection_listener]
+    manager.listeners["availability"] = [availability_listener]
+
+    await manager._notify_connection_state_change()
+
+    assert received_on_connection == []
+    assert len(received_on_availability) == 1
+    assert set(received_on_availability[0].keys()) == {"state", "available"}
+
+
+def test_availability_channel_is_registerable():
+    """The "availability" channel is a recognized listener type."""
+    from custom_components.ksenia_lares.websocketmanager import WebSocketManager
+
+    manager = WebSocketManager("192.168.1.50", "1234", 443, MagicMock())
+    assert "availability" in manager.listeners
+    assert "connection" in manager.listeners
+
+
+@pytest.mark.asyncio
 async def test_ksenia_alarm_tamper_status_sensor_initialization():
     """Test alarm tamper sensor initializes correctly."""
     from custom_components.ksenia_lares.sensor import KseniaAlarmTamperStatusSensor
@@ -1394,10 +1555,24 @@ async def test_alarm_control_panel_supported_features():
     ws_manager = MagicMock()
     scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "3"}
     panel = KseniaAlarmControlPanel(ws_manager, scenario_map)
-    
+
     features = panel.supported_features
     assert features & AlarmControlPanelEntityFeature.ARM_AWAY
     assert features & AlarmControlPanelEntityFeature.ARM_HOME
+    # ARM_NIGHT is disabled by default — no "NIGHT" scenario configured
+    assert not features & AlarmControlPanelEntityFeature.ARM_NIGHT
+
+
+def test_alarm_control_panel_supported_features_arm_night_enabled():
+    """ARM_NIGHT appears once a NIGHT scenario is present in the map."""
+    from custom_components.ksenia_lares.alarm_control_panel import KseniaAlarmControlPanel
+    from homeassistant.components.alarm_control_panel import AlarmControlPanelEntityFeature
+
+    ws_manager = MagicMock()
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "3", "NIGHT": "4"}
+    panel = KseniaAlarmControlPanel(ws_manager, scenario_map)
+
+    assert panel.supported_features & AlarmControlPanelEntityFeature.ARM_NIGHT
 
 
 @pytest.mark.asyncio
@@ -1480,8 +1655,55 @@ async def test_alarm_control_panel_arm_home():
     scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "3"}
     panel = KseniaAlarmControlPanel(ws_manager, scenario_map)
     panel.async_write_ha_state = MagicMock()
-    
+
     await panel.async_alarm_arm_home(code="123456")
+
+
+@pytest.mark.asyncio
+async def test_alarm_control_panel_arm_night_success():
+    """Test arm night executes the configured NIGHT scenario."""
+    from custom_components.ksenia_lares.alarm_control_panel import KseniaAlarmControlPanel
+
+    ws_manager = MagicMock()
+    ws_manager.executeScenario_with_login = AsyncMock(return_value=True)
+    ws_manager.register_listener = MagicMock()
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "3", "NIGHT": "4"}
+    panel = KseniaAlarmControlPanel(ws_manager, scenario_map)
+    panel.async_write_ha_state = MagicMock()
+
+    await panel.async_alarm_arm_night(code="123456")
+
+    ws_manager.executeScenario_with_login.assert_called_once_with("4", pin="123456")
+
+
+@pytest.mark.asyncio
+async def test_alarm_control_panel_arm_night_requires_code():
+    """Test arm night requires a PIN."""
+    from custom_components.ksenia_lares.alarm_control_panel import KseniaAlarmControlPanel
+
+    ws_manager = MagicMock()
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "3", "NIGHT": "4"}
+    panel = KseniaAlarmControlPanel(ws_manager, scenario_map)
+
+    with pytest.raises(HomeAssistantError):
+        await panel.async_alarm_arm_night(code=None)
+
+
+@pytest.mark.asyncio
+async def test_alarm_control_panel_arm_night_not_configured():
+    """Test arm night raises when no NIGHT scenario is configured (default state)."""
+    from custom_components.ksenia_lares.alarm_control_panel import KseniaAlarmControlPanel
+
+    ws_manager = MagicMock()
+    ws_manager.executeScenario_with_login = AsyncMock(return_value=True)
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "3"}
+    panel = KseniaAlarmControlPanel(ws_manager, scenario_map)
+
+    with pytest.raises(HomeAssistantError):
+        await panel.async_alarm_arm_night(code="123456")
+
+    ws_manager.executeScenario_with_login.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1559,6 +1781,351 @@ async def test_alarm_control_panel_state_update_from_realtime():
     
     # Verify partition data is stored
     assert panel._partitions_status == update_data
+
+
+def test_apply_arm_home_override_no_override_set():
+    """No configured override leaves the default PARTIAL mapping untouched."""
+    from custom_components.ksenia_lares.alarm_control_panel import _apply_arm_home_override
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "4"}
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    config_entry = MagicMock()
+    config_entry.options = {}
+
+    _apply_arm_home_override(scenario_map, scenarios, config_entry)
+
+    assert scenario_map["PARTIAL"] == "4"
+
+
+def test_apply_arm_home_override_valid_override():
+    """A configured, still-valid PARTIAL scenario ID overrides the default."""
+    from custom_components.ksenia_lares.alarm_control_panel import (
+        CONF_ARM_HOME_SCENARIO_ID,
+        _apply_arm_home_override,
+    )
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "4"}
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    config_entry = MagicMock()
+    config_entry.options = {CONF_ARM_HOME_SCENARIO_ID: "3"}
+
+    _apply_arm_home_override(scenario_map, scenarios, config_entry)
+
+    assert scenario_map["PARTIAL"] == "3"
+
+
+def test_apply_arm_home_override_stale_override_falls_back():
+    """A configured scenario ID that's no longer CAT=PARTIAL falls back to the default."""
+    from custom_components.ksenia_lares.alarm_control_panel import (
+        CONF_ARM_HOME_SCENARIO_ID,
+        _apply_arm_home_override,
+    )
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "4"}
+    # Scenario 3 was removed from the panel since the option was configured.
+    scenarios = [
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    config_entry = MagicMock()
+    config_entry.options = {CONF_ARM_HOME_SCENARIO_ID: "3"}
+
+    _apply_arm_home_override(scenario_map, scenarios, config_entry)
+
+    assert scenario_map["PARTIAL"] == "4"
+
+
+def test_apply_arm_night_scenario_not_configured_by_default():
+    """No configured Arm Night scenario leaves the map without a NIGHT entry."""
+    from custom_components.ksenia_lares.alarm_control_panel import _apply_arm_night_scenario
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "4"}
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    config_entry = MagicMock()
+    config_entry.options = {}
+
+    _apply_arm_night_scenario(scenario_map, scenarios, config_entry)
+
+    assert "NIGHT" not in scenario_map
+
+
+def test_apply_arm_night_scenario_valid_selection():
+    """A configured, valid PARTIAL scenario ID enables Arm Night."""
+    from custom_components.ksenia_lares.alarm_control_panel import (
+        CONF_ARM_NIGHT_SCENARIO_ID,
+        _apply_arm_night_scenario,
+    )
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "4"}
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    config_entry = MagicMock()
+    config_entry.options = {CONF_ARM_NIGHT_SCENARIO_ID: "3"}
+
+    _apply_arm_night_scenario(scenario_map, scenarios, config_entry)
+
+    assert scenario_map["NIGHT"] == "3"
+
+
+def test_apply_arm_night_scenario_stale_selection_stays_disabled():
+    """A configured scenario ID that's no longer CAT=PARTIAL leaves Arm Night disabled."""
+    from custom_components.ksenia_lares.alarm_control_panel import (
+        CONF_ARM_NIGHT_SCENARIO_ID,
+        _apply_arm_night_scenario,
+    )
+
+    scenario_map = {"DISARM": "1", "ARM": "2", "PARTIAL": "4"}
+    # Scenario 3 was removed from the panel since the option was configured.
+    scenarios = [
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    config_entry = MagicMock()
+    config_entry.options = {CONF_ARM_NIGHT_SCENARIO_ID: "3"}
+
+    _apply_arm_night_scenario(scenario_map, scenarios, config_entry)
+
+    assert "NIGHT" not in scenario_map
+
+
+@pytest.mark.asyncio
+async def test_options_flow_lists_only_partial_scenarios_defaulting_to_last():
+    """Options flow offers CAT=PARTIAL scenarios for both fields.
+
+    Arm Home defaults to the last one (today's actual behavior); Arm Night
+    has no default — it stays unselected until explicitly configured.
+    """
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import (
+        CONF_ARM_HOME_SCENARIO_ID,
+        CONF_ARM_NIGHT_SCENARIO_ID,
+        DOMAIN,
+    )
+
+    scenarios = [
+        {"ID": "1", "DES": "Disarm", "CAT": "DISARM"},
+        {"ID": "2", "DES": "Arm Away", "CAT": "ARM"},
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    ws_manager = MagicMock()
+    ws_manager.getScenarios = AsyncMock(return_value=scenarios)
+
+    config_entry = MagicMock()
+    config_entry.options = {}
+
+    hass = MagicMock()
+    hass.data = {DOMAIN: {"ws_manager": ws_manager}}
+    hass.config_entries.async_get_known_entry = MagicMock(return_value=config_entry)
+
+    flow = KseniaOptionsFlowHandler()
+    flow.hass = hass
+    flow.handler = "test_entry_id"
+
+    result = await flow.async_step_init(user_input=None)
+
+    assert result["type"] == "form"
+    assert result["step_id"] == "init"
+    schema = result["data_schema"]
+    markers = {marker: marker for marker in schema.schema}
+    home_marker = markers[CONF_ARM_HOME_SCENARIO_ID]
+    night_marker = markers[CONF_ARM_NIGHT_SCENARIO_ID]
+
+    home_options = {opt["value"] for opt in schema.schema[home_marker].config["options"]}
+    night_options = {opt["value"] for opt in schema.schema[night_marker].config["options"]}
+    assert home_options == {"3", "4"}
+    assert night_options == {"3", "4"}
+
+    assert home_marker.description["suggested_value"] == "4"
+    # No default for Arm Night — stays unselected until explicitly configured.
+    assert not night_marker.description
+
+
+@pytest.mark.asyncio
+async def test_options_flow_shows_previously_configured_arm_night_selection():
+    """A previously-saved Arm Night scenario is preselected when reopening options."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import CONF_ARM_NIGHT_SCENARIO_ID, DOMAIN
+
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+        {"ID": "4", "DES": "ARM MOTION", "CAT": "PARTIAL"},
+    ]
+    ws_manager = MagicMock()
+    ws_manager.getScenarios = AsyncMock(return_value=scenarios)
+
+    config_entry = MagicMock()
+    config_entry.options = {CONF_ARM_NIGHT_SCENARIO_ID: "3"}
+
+    hass = MagicMock()
+    hass.data = {DOMAIN: {"ws_manager": ws_manager}}
+    hass.config_entries.async_get_known_entry = MagicMock(return_value=config_entry)
+
+    flow = KseniaOptionsFlowHandler()
+    flow.hass = hass
+    flow.handler = "test_entry_id"
+
+    result = await flow.async_step_init(user_input=None)
+
+    schema = result["data_schema"]
+    night_marker = next(m for m in schema.schema if m == CONF_ARM_NIGHT_SCENARIO_ID)
+    assert night_marker.description["suggested_value"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_options_flow_submit_creates_entry():
+    """Submitting the options form saves the selection."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import CONF_ARM_HOME_SCENARIO_ID
+
+    flow = KseniaOptionsFlowHandler()
+    user_input = {CONF_ARM_HOME_SCENARIO_ID: "3"}
+
+    result = await flow.async_step_init(user_input=user_input)
+
+    assert result["type"] == "create_entry"
+    assert result["data"] == user_input
+
+
+@pytest.mark.asyncio
+async def test_options_flow_submit_scan_interval_zero_disables_polling():
+    """Submitting scan_interval=0 is allowed (disables polling), not an error."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from homeassistant.const import CONF_SCAN_INTERVAL
+
+    flow = KseniaOptionsFlowHandler()
+    user_input = {CONF_SCAN_INTERVAL: 0}
+
+    result = await flow.async_step_init(user_input=user_input)
+
+    assert result["type"] == "create_entry"
+    assert result["data"] == user_input
+
+
+@pytest.mark.asyncio
+async def test_options_flow_submit_scan_interval_valid_nonzero():
+    """Submitting a valid non-zero scan_interval (>= MIN_SCAN_INTERVAL) is accepted."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from homeassistant.const import CONF_SCAN_INTERVAL
+
+    flow = KseniaOptionsFlowHandler()
+    user_input = {CONF_SCAN_INTERVAL: 30}
+
+    result = await flow.async_step_init(user_input=user_input)
+
+    assert result["type"] == "create_entry"
+    assert result["data"] == user_input
+
+
+@pytest.mark.asyncio
+async def test_options_flow_rejects_scan_interval_below_floor():
+    """A scan_interval between 1 and MIN_SCAN_INTERVAL-1 is rejected and the form is redisplayed."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import DOMAIN
+    from homeassistant.const import CONF_SCAN_INTERVAL
+
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+    ]
+    ws_manager = MagicMock()
+    ws_manager.getScenarios = AsyncMock(return_value=scenarios)
+
+    config_entry = MagicMock()
+    config_entry.options = {}
+    hass = MagicMock()
+    hass.data = {DOMAIN: {"ws_manager": ws_manager}}
+    hass.config_entries.async_get_known_entry = MagicMock(return_value=config_entry)
+
+    flow = KseniaOptionsFlowHandler()
+    flow.hass = hass
+    flow.handler = "test_entry_id"
+
+    result = await flow.async_step_init(user_input={CONF_SCAN_INTERVAL: 5})
+
+    assert result["type"] == "form"
+    assert result["errors"][CONF_SCAN_INTERVAL] == "scan_interval_too_low"
+
+
+@pytest.mark.asyncio
+async def test_options_flow_scan_interval_defaults_to_default_scan_interval():
+    """The scan_interval field suggests DEFAULT_SCAN_INTERVAL when never configured."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import DEFAULT_SCAN_INTERVAL, DOMAIN
+    from homeassistant.const import CONF_SCAN_INTERVAL
+
+    scenarios = [
+        {"ID": "3", "DES": "Arm Home", "CAT": "PARTIAL"},
+    ]
+    ws_manager = MagicMock()
+    ws_manager.getScenarios = AsyncMock(return_value=scenarios)
+
+    config_entry = MagicMock()
+    config_entry.options = {}
+    hass = MagicMock()
+    hass.data = {DOMAIN: {"ws_manager": ws_manager}}
+    hass.config_entries.async_get_known_entry = MagicMock(return_value=config_entry)
+
+    flow = KseniaOptionsFlowHandler()
+    flow.hass = hass
+    flow.handler = "test_entry_id"
+
+    result = await flow.async_step_init(user_input=None)
+
+    schema = result["data_schema"]
+    scan_interval_marker = next(m for m in schema.schema if m == CONF_SCAN_INTERVAL)
+    assert scan_interval_marker.description["suggested_value"] == DEFAULT_SCAN_INTERVAL
+
+
+@pytest.mark.asyncio
+async def test_options_flow_aborts_when_not_connected():
+    """Options flow aborts if the integration has no active ws_manager."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import DOMAIN
+
+    hass = MagicMock()
+    hass.data = {DOMAIN: {}}
+
+    flow = KseniaOptionsFlowHandler()
+    flow.hass = hass
+
+    result = await flow.async_step_init(user_input=None)
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "not_connected"
+
+
+@pytest.mark.asyncio
+async def test_options_flow_aborts_when_no_partial_scenarios():
+    """Options flow aborts if the panel has no CAT=PARTIAL scenario configured."""
+    from custom_components.ksenia_lares.config_flow import KseniaOptionsFlowHandler
+    from custom_components.ksenia_lares.const import DOMAIN
+
+    ws_manager = MagicMock()
+    ws_manager.getScenarios = AsyncMock(
+        return_value=[
+            {"ID": "1", "DES": "Disarm", "CAT": "DISARM"},
+            {"ID": "2", "DES": "Arm Away", "CAT": "ARM"},
+        ]
+    )
+    hass = MagicMock()
+    hass.data = {DOMAIN: {"ws_manager": ws_manager}}
+
+    flow = KseniaOptionsFlowHandler()
+    flow.hass = hass
+
+    result = await flow.async_step_init(user_input=None)
+
+    assert result["type"] == "abort"
+    assert result["reason"] == "no_partial_scenarios"
 
 
 @pytest.mark.asyncio
@@ -1817,7 +2384,7 @@ async def test_notify_connection_state_after_cleanup_in_handle_connection_closed
     async def connection_listener(payload):
         observed_readData.append(manager._readData)
 
-    manager.listeners["connection"] = [connection_listener]
+    manager.listeners["availability"] = [connection_listener]
 
     # Prevent actual reconnection
     manager._reconnecting = True

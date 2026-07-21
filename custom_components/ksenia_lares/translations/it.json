@@ -36,6 +36,26 @@
       "reconfigure_successful": "Configurazione Ksenia Lares aggiornata correttamente"
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni Ksenia Lares",
+        "description": "Scegli quale scenario di Inserimento Parziale esegue l'azione Inserito Parziale (Arm Home). Puoi anche selezionarne uno per l'azione Notturno (Arm Night) — resta disabilitata finché non ne scegli uno. Puoi anche impostare l'intervallo di polling dello stato, oppure impostarlo a 0 per disabilitare il polling e affidarti solo agli aggiornamenti in tempo reale inviati dalla centrale.",
+        "data": {
+          "arm_home_scenario_id": "Scenario per Inserito Parziale",
+          "arm_night_scenario_id": "Scenario per Notturno (opzionale)",
+          "scan_interval": "Intervallo di polling (secondi, 0 = disabilitato)"
+        }
+      }
+    },
+    "error": {
+      "scan_interval_too_low": "L'intervallo di polling deve essere 0 (disabilitato) oppure almeno 10 secondi."
+    },
+    "abort": {
+      "not_connected": "Impossibile caricare gli scenari — l'integrazione non è attualmente connessa alla centrale.",
+      "no_partial_scenarios": "Nessuno scenario di Inserimento Parziale (CAT=PARTIAL) trovato sulla centrale — niente da configurare."
+    }
+  },
   "entity": {
     "button": {
       "clear_communications": {
@@ -214,6 +234,12 @@
     },
     "arm_home_failed": {
       "message": "Comando di inserimento parziale fallito"
+    },
+    "arm_night_not_configured": {
+      "message": "La funzione Notturno non è configurata. Seleziona uno scenario per essa nelle opzioni dell'integrazione."
+    },
+    "arm_night_failed": {
+      "message": "Comando di inserimento notturno fallito"
     }
   },
   "selector": {

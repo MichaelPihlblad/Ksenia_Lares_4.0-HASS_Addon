@@ -21,7 +21,7 @@ import websockets
 from websockets.asyncio.client import connect as ws_connect
 from websockets.typing import Subprotocol
 
-from .const import DEFAULT_BRAND, DeviceBrand
+from .const import DEFAULT_BRAND, DEFAULT_SCAN_INTERVAL, DeviceBrand
 from .wscall import (
     bypassZone,
     clearCommunications,
@@ -52,8 +52,7 @@ MAX_RETRY_DELAY = 300  # 5 minutes max
 COMMAND_TIMEOUT = 5  # Timeout for command execution (seconds)
 DATA_WAIT_TIMEOUT = 10
 RECV_TIMEOUT = 3
-CONNECTION_HEALTH_CHECK = 120  # 2 minutes
-PERIODIC_READ_INTERVAL = 60  # Periodic state reconciliation
+CONNECTION_HEALTH_CHECK = 120  # 2 minutes; floor for the dynamic health-check threshold
 
 
 class ConnectionState(Enum):
@@ -265,6 +264,7 @@ class WebSocketManager:
         max_retries=None,
         on_prolonged_connection_loss: Callable[[], Awaitable[None] | None] | None = None,
         brand: str = DEFAULT_BRAND,
+        periodic_read_interval=None,
     ):
         """Initialize WebSocket manager.
 
@@ -279,6 +279,9 @@ class WebSocketManager:
             brand: Device brand ("ksenia" or "bticino"), selects TLS settings used
                 for secure connections. BTicino panels (e.g. 4200C) need relaxed
                 cipher settings that plain Ksenia panels don't require.
+            periodic_read_interval: Seconds between periodic full-state reconciliation
+                reads (default: DEFAULT_SCAN_INTERVAL=60). 0 disables periodic polling
+                entirely, relying solely on realtime push updates from the panel.
         """
         # Connection settings
         self._ip = ip
@@ -295,6 +298,12 @@ class WebSocketManager:
         self._connection_state = ConnectionState.DISCONNECTED
         self._connSecure = False
         self._last_message_time = 0
+        self._periodic_read_interval = (
+            periodic_read_interval if periodic_read_interval is not None else DEFAULT_SCAN_INTERVAL
+        )
+        # Only meaningful when polling is on; scales with it so the watchdog never
+        # fires before at least two periodic reads could plausibly have happened.
+        self._health_check_interval = max(CONNECTION_HEALTH_CHECK, self._periodic_read_interval * 2)
 
         # Background tasks
         self._listener_task = None
@@ -342,11 +351,13 @@ class WebSocketManager:
             "partitions": [],
             "zones": [],
             "systems": [],
-            "connection": [],
+            "connection": [],  # Real STATUS_CONNECTION data from the panel (list of connection objects)
+            "availability": [],  # WS lifecycle ping (dict) - connect/disconnect/reconnect notifications
             "panel": [],
             "tampers": [],
             "faults": [],
             "thermostats": [],
+            "event_logs": [],
         }
 
         # Connection metrics
@@ -361,7 +372,7 @@ class WebSocketManager:
         # Debug mode based on logger level (safe for mocks)
         try:
             self._debug_mode = logger.getEffectiveLevel() <= logging.DEBUG
-        except (TypeError, AttributeError):
+        except TypeError, AttributeError:
             # Handle test mocks or non-standard loggers
             self._debug_mode = False
 
@@ -398,13 +409,18 @@ class WebSocketManager:
         return self._connection_state == ConnectionState.CONNECTED
 
     async def _notify_connection_state_change(self) -> None:
-        """Notify listeners about connection state transitions."""
+        """Notify listeners about connection state transitions.
+
+        Uses the "availability" channel, distinct from "connection" (which
+        carries the real STATUS_CONNECTION list payload from the panel) -
+        this is just a lifecycle ping for entities to refresh `available`.
+        """
         payload = {
             "state": self._connection_state.value,
             "available": self.available,
         }
         try:
-            await self._notify_listeners(["connection"], payload)
+            await self._notify_listeners(["availability"], payload)
         except Exception as err:
             self._logger.debug("Error notifying connection listeners: %s", err)
 
@@ -682,7 +698,13 @@ class WebSocketManager:
                 self._running = True
                 self._listener_task = asyncio.create_task(self.listener())
                 self._command_task = asyncio.create_task(self.process_command_queue())
-                self._health_task = asyncio.create_task(self._monitor_connection_health())
+                if self._periodic_read_interval > 0:
+                    self._health_task = asyncio.create_task(self._monitor_connection_health())
+                else:
+                    self._logger.info(
+                        "Connection-health watchdog disabled — relying on the WebSocket "
+                        "ping/pong keepalive and the listener's own disconnect detection"
+                    )
 
                 # Retrieve initial data (listener must be running to handle responses)
                 self._logger.info(f"[{time.time():.3f}] Starting initial data fetch...")
@@ -694,7 +716,15 @@ class WebSocketManager:
                     raise ConnectionError(f"Initial data fetch failed: {e}") from e
 
                 # Start remaining background tasks
-                self._periodic_task = asyncio.create_task(self._periodic_read_task())
+                if self._periodic_read_interval > 0:
+                    self._periodic_task = asyncio.create_task(self._periodic_read_task())
+                    self._logger.info(
+                        "Periodic state polling enabled every %ss", self._periodic_read_interval
+                    )
+                else:
+                    self._logger.info(
+                        "Periodic state polling disabled — relying solely on realtime push updates"
+                    )
                 self._retries = 0
                 self._prolonged_loss_callback_invoked = False
                 # Reset max_retries to default after successful connection
@@ -777,10 +807,10 @@ class WebSocketManager:
         """Monitor WebSocket connection health and detect stale connections."""
         while self._running:
             try:
-                await asyncio.sleep(CONNECTION_HEALTH_CHECK)
+                await asyncio.sleep(self._health_check_interval)
 
                 time_since_message = time.time() - self._last_message_time
-                if time_since_message > CONNECTION_HEALTH_CHECK:
+                if time_since_message > self._health_check_interval:
                     self._logger.warning(
                         f"No messages received for {time_since_message:.0f}s, "
                         "connection appears stale - triggering reconnect"
@@ -802,11 +832,16 @@ class WebSocketManager:
         """Periodically read state for reconciliation across all clients."""
         while self._running:
             try:
-                await asyncio.sleep(PERIODIC_READ_INTERVAL)
+                await asyncio.sleep(self._periodic_read_interval)
                 time_since_last = time.time() - self._last_periodic_read
-                if time_since_last >= PERIODIC_READ_INTERVAL:
+                if time_since_last >= self._periodic_read_interval:
                     await self._refresh_all_state()
                     self._last_periodic_read = time.time()
+                    try:
+                        logs = await self.getLastLogs(count=5)
+                        await self._notify_listeners(["event_logs"], logs)
+                    except Exception as e:
+                        self._logger.warning(f"Periodic log fetch error: {e}")
             except asyncio.CancelledError:
                 # Task is being cancelled during shutdown
                 self._logger.debug("Periodic read task cancelled due to shutdown")
@@ -1638,7 +1673,7 @@ class WebSocketManager:
         """
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return default
 
     async def process_command_queue(self):
@@ -2279,8 +2314,9 @@ class WebSocketManager:
                 config_payload_type = sName
                 status_payload_type = f"STATUS_{sName}"
 
-            # Use cached data from periodic refresh (every 60s) - no redundant network calls
-            # Periodic refresh already populates _readData with all config payload types
+            # Use cached data - no redundant network calls. Refreshed periodically
+            # when polling is enabled; otherwise populated once at initial connect
+            # and kept current for status fields via realtime push updates.
             config_entities = self._readData.get(config_payload_type, [])
 
             # Get current status entities from unified cache (updated by both READ and REALTIME)
